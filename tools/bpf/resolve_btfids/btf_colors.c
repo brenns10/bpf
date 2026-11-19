@@ -56,7 +56,7 @@ static int cmp_loc(const void *a, const void *b)
 	return 0;
 }
 
-static void remap(struct btf *btf, const __u32 *id_map, __u32 src_start_id)
+static int remap(struct btf *btf, const __u32 *id_map, __u32 src_start_id)
 {
 	const struct btf *base = btf__base_btf(btf);
 	__u32 start_id = base ? btf__type_cnt(base) : 1;
@@ -70,12 +70,36 @@ static void remap(struct btf *btf, const __u32 *id_map, __u32 src_start_id)
 		btf_field_iter_init(&it, t, BTF_FIELD_ITER_IDS);
 		while ((id = btf_field_iter_next(&it))) {
 			/* Void and types in the original ancestor are unchanged. */
-			if (*id >= src_start_id)
+			if (*id >= src_start_id) {
+				if (!id_map[*id - src_start_id])
+					return -EINVAL;
 				*id = id_map[*id - src_start_id];
+			}
 		}
 		if (btf_is_locsec(t))
 			qsort(btf_locsec_locs(t), btf_vlen(t), sizeof(struct btf_loc), cmp_loc);
 	}
+	return 0;
+}
+
+static int add_filtered_datasec(struct btf *dst, struct btf *src,
+				const struct btf_type *t, const __u8 *colors)
+{
+	const struct btf_var_secinfo *vsi = btf_var_secinfos(t);
+	int id, err;
+	__u32 i;
+
+	id = btf__add_datasec(dst, btf__name_by_offset(src, t->name_off), t->size);
+	if (id < 0)
+		return id;
+	for (i = 0; i < btf_vlen(t); i++) {
+		if (colors[vsi[i].type] == BTF_COLOR_DISCARD)
+			continue;
+		err = btf__add_datasec_var_info(dst, vsi[i].type, vsi[i].offset, vsi[i].size);
+		if (err)
+			return err;
+	}
+	return id;
 }
 
 /*
@@ -100,7 +124,7 @@ int btf_split_by_color(struct btf *src, const __u8 *colors,
 	*main_out = NULL;
 	*inline_out = NULL;
 	*global_out = NULL;
-	id_map = malloc((type_cnt - start_id ?: 1) * sizeof(*id_map));
+	id_map = calloc(type_cnt - start_id ?: 1, sizeof(*id_map));
 	if (!id_map)
 		return -ENOMEM;
 	main_btf = btf__new_empty_opts(&opts);
@@ -109,7 +133,8 @@ int btf_split_by_color(struct btf *src, const __u8 *colors,
 	btf__set_endianness(main_btf, btf__endianness(src));
 	/* Copy MAIN and SHARED marked types to `main_out`. */
 	for (i = start_id; i < type_cnt; i++) {
-		if (colors[i] == BTF_COLOR_LOC || colors[i] == BTF_COLOR_GLOBAL)
+		if (colors[i] == BTF_COLOR_LOC || colors[i] == BTF_COLOR_GLOBAL ||
+		    colors[i] == BTF_COLOR_DISCARD)
 			continue;
 		err = btf__add_type(main_btf, src, btf__type_by_id(src, i));
 		if (err < 0)
@@ -139,16 +164,23 @@ int btf_split_by_color(struct btf *src, const __u8 *colors,
 		goto out;
 	}
 	for (i = start_id; i < type_cnt; i++) {
+		const struct btf_type *t = btf__type_by_id(src, i);
+
 		if (colors[i] != BTF_COLOR_GLOBAL)
 			continue;
-		err = btf__add_type(global_btf, src, btf__type_by_id(src, i));
+		if (btf_is_datasec(t))
+			err = add_filtered_datasec(global_btf, src, t, colors);
+		else
+			err = btf__add_type(global_btf, src, t);
 		if (err < 0)
 			goto out;
 		id_map[i - start_id] = err;
 	}
-	remap(main_btf, id_map, start_id);
-	remap(inline_btf, id_map, start_id);
-	remap(global_btf, id_map, start_id);
+	err = remap(main_btf, id_map, start_id);
+	err = err ?: remap(inline_btf, id_map, start_id);
+	err = err ?: remap(global_btf, id_map, start_id);
+	if (err)
+		goto out;
 	*main_out = main_btf;
 	*inline_out = inline_btf;
 	*global_out = global_btf;

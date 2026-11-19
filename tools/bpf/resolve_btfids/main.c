@@ -85,6 +85,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <regex.h>
 #include <linux/btf_ids.h>
 #include <linux/kallsyms.h>
 #include <linux/rbtree.h>
@@ -155,6 +156,7 @@ struct object {
 	bool distill_base;
 	bool extract_inline;
 	bool extract_global;
+	regex_t *global_var_exclude;
 
 	struct {
 		int		 fd;
@@ -1831,8 +1833,9 @@ static int color_btf(struct object *obj, __u8 *colors)
 	return 0;
 }
 
-static void color_global_btf(struct btf *btf, __u8 *colors)
+static void color_global_btf(struct object *obj, __u8 *colors)
 {
+	struct btf *btf = obj->btf;
 	const struct btf *base = btf__base_btf(btf);
 	u32 start_id = base ? btf__type_cnt(base) : 1;
 	u32 type_cnt = btf__type_cnt(btf), i, j;
@@ -1861,16 +1864,41 @@ static void color_global_btf(struct btf *btf, __u8 *colors)
 		colors[i] = color;
 		vsi = btf_var_secinfos(t);
 		for (j = 0; j < btf_vlen(t); j++)
-			if (vsi[j].type >= start_id)
+			if (vsi[j].type >= start_id && color == BTF_COLOR_MAIN)
 				colors[vsi[j].type] = color;
+	}
+	/* Per-CPU membership takes precedence, even for VARs in several DATASECs. */
+	if (obj->global_var_exclude) {
+		for (i = start_id; i < type_cnt; i++) {
+			const struct btf_type *t = btf__type_by_id(btf, i);
+
+			if (btf_is_var(t) && colors[i] == BTF_COLOR_GLOBAL &&
+			    !regexec(obj->global_var_exclude,
+				     btf__name_by_offset(btf, t->name_off), 0, NULL, 0))
+				colors[i] = BTF_COLOR_DISCARD;
+		}
+		/* Drop global DATASECs left without any variables. */
+		for (i = start_id; i < type_cnt; i++) {
+			const struct btf_type *t = btf__type_by_id(btf, i);
+			const struct btf_var_secinfo *vsi;
+
+			if (!btf_is_datasec(t) || colors[i] != BTF_COLOR_GLOBAL)
+				continue;
+			vsi = btf_var_secinfos(t);
+			for (j = 0; j < btf_vlen(t); j++)
+				if (colors[vsi[j].type] != BTF_COLOR_DISCARD)
+					break;
+			if (j == btf_vlen(t))
+				colors[i] = BTF_COLOR_DISCARD;
+		}
 	}
 	/* Mark DECL_TAGs the same as the VAR they modify */
 	for (i = start_id; i < type_cnt; i++) {
 		const struct btf_type *t = btf__type_by_id(btf, i);
 
 		if (btf_is_decl_tag(t) && t->type >= start_id &&
-		    colors[t->type] == BTF_COLOR_GLOBAL)
-			colors[i] = BTF_COLOR_GLOBAL;
+		    btf_is_var(btf__type_by_id(btf, t->type)))
+			colors[i] = colors[t->type];
 	}
 }
 
@@ -1887,7 +1915,7 @@ static int split_btf(struct object *obj)
 	if (err)
 		goto out;
 	if (obj->extract_global)
-		color_global_btf(btf, colors);
+		color_global_btf(obj, colors);
 	err = btf_split_by_color(btf, colors, &main_btf, &inline_btf, &global_btf);
 	if (!err) {
 		obj->orig_btf = btf;
@@ -2154,6 +2182,8 @@ int main(int argc, const char **argv)
 		.sets     = RB_ROOT,
 	};
 	const char *btfids_path = NULL;
+	const char *global_var_exclude = NULL;
+	regex_t global_var_regex;
 	struct btf_links btf_links = {};
 	bool fatal_warnings = false;
 	bool resolve_btfids = true;
@@ -2175,6 +2205,8 @@ int main(int argc, const char **argv)
 			    "extract location BTF into a .BTF.inline file"),
 		OPT_BOOLEAN(0, "global", &obj.extract_global,
 			    "extract non-per-CPU variables into a .BTF.global file"),
+		OPT_STRING(0, "global-var-exclude", &global_var_exclude, "regexp",
+			   "exclude non-per-CPU VARs by POSIX extended regexp (requires --global)"),
 		OPT_BOOLEAN(0, "fmodret_scan", &fmodret_scan,
 			    "tag the functions which return errors as fmod_ret targets"),
 		OPT_CALLBACK(0, "btf_link", &btf_links, "section:module:btf-file",
@@ -2189,6 +2221,22 @@ int main(int argc, const char **argv)
 			     PARSE_OPT_STOP_AT_NON_OPTION);
 	if (argc != 1)
 		usage_with_options(resolve_btfids_usage, btfid_options);
+	if (global_var_exclude) {
+		char errbuf[256];
+		int ret;
+
+		if (!obj.extract_global || btfids_path) {
+			pr_err("--global-var-exclude requires --global without --patch_btfids\n");
+			goto out;
+		}
+		ret = regcomp(&global_var_regex, global_var_exclude, REG_EXTENDED | REG_NOSUB);
+		if (ret) {
+			regerror(ret, &global_var_regex, errbuf, sizeof(errbuf));
+			pr_err("Invalid --global-var-exclude regexp: %s\n", errbuf);
+			goto out;
+		}
+		obj.global_var_exclude = &global_var_regex;
+	}
 	if (btf_links.cnt && !btfids_path) {
 		pr_err("--btf_link requires --patch_btfids\n");
 		goto out;
@@ -2286,6 +2334,8 @@ dump_btf:
 	err = fatal_warnings && warnings ? -1 : 0;
 out:
 	free_btf_links(&btf_links);
+	if (obj.global_var_exclude)
+		regfree(obj.global_var_exclude);
 	/*
 	 * Free BTFs in reverse dependency order. global/inline borrow obj.btf;
 	 * obj.btf can borrow a base owned by orig_btf or obj.base_btf, and

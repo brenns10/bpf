@@ -70,6 +70,24 @@ gen_btf_data()
 {
 	inline=${BTF_INLINE:+--inline}
 	global=${BTF_GLOBAL:+--global}
+	if [ -n "${BTF_GLOBAL}" ]; then
+		# Some valid global variables are quite repetitive and unlikely to be
+		# looked up by debuggers, the primary consumer of global variable BTF.
+		# This pattern is not exhaustive, but it covers several large
+		# categories. All of these are macro-generated variables which have a
+		# well-known type. If a debugger wanted to use them, it could use the
+		# symbol address and the well-known type.
+
+		# Static call keys
+		global_var_exclude='^__SCK__'
+
+		# LSM hook static keys
+		global_var_exclude="${global_var_exclude}|^security_hook_active_"
+
+		# Tracepoint metadata
+		global_var_exclude="${global_var_exclude}|^(__event_|__tracepoint_|trace_event_type_funcs_)"
+		global_var_exclude="${global_var_exclude}|^(__TRACE_SYSTEM_|TRACE_SYSTEM_)"
+	fi
 	btf1="${ELF_FILE}.BTF.1"
 	${PAHOLE} -J ${PAHOLE_FLAGS}			\
 		${BTF_BASE:+--btf_base ${BTF_BASE}}	\
@@ -80,6 +98,8 @@ gen_btf_data()
 		${BTF_BASE:+--btf_base ${BTF_BASE}}	\
 		${inline}				\
 		${global}				\
+		${BTF_GLOBAL:+--global-var-exclude}	\
+		${BTF_GLOBAL:+"${global_var_exclude}"}	\
 		--btf ${btf1} "${ELF_FILE}"
 }
 
